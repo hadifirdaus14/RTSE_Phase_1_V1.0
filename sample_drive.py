@@ -60,7 +60,7 @@ class RTTask(threading.Thread):
                 ctypes.windll.kernel32.SetThreadPriority(handle, 0)
             elif self.priority == TaskPriority.LOW:
                 ctypes.windll.kernel32.SetThreadPriority(handle, -2)
-        except Exception as e:
+        except Exception:
             pass
 
         while is_running:
@@ -199,32 +199,95 @@ def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 def processing_task():
-    #This is where you write your image processing code to decide how to control the car
-    #You can use libraries like OpenCV to process the image
-    #There is no limtation to the complexity of the processing task, you can use any libraries you want
-    #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    if front_frame is not None:
-        # write your processing here
-        pass
+
+    if front_frame is None:
+        return
+
+    hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
+    _, w = front_frame.shape[:2]
+
+    # --- Colour masks (HSV) ---
+    green_mask = cv2.inRange(hsv, np.array([40, 50, 50]),  np.array([80, 255, 255]))
+    red_mask   = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([0,   50, 50]), np.array([10,  255, 255])),
+        cv2.inRange(hsv, np.array([170, 50, 50]), np.array([180, 255, 255]))
+    )
+    yellow_mask = cv2.inRange(hsv, np.array([20, 50, 50]), np.array([35, 255, 255]))
+    danger_mask = cv2.bitwise_or(red_mask, yellow_mask)
+
+    # Morphological cleanup to remove noise
+    kernel = np.ones((5, 5), np.uint8)
+    green_mask  = cv2.morphologyEx(green_mask,  cv2.MORPH_OPEN, kernel)
+    danger_mask = cv2.morphologyEx(danger_mask, cv2.MORPH_OPEN, kernel)
+
+    # --- Contour detection ---
+    green_contours,  _ = cv2.findContours(green_mask,  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    danger_contours, _ = cv2.findContours(danger_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    MIN_AREA  = 200
+    center_x  = w // 2
+    steering  = 0.0
+    acceleration = 1.0
+
+    # Pick the largest green token as the collection target
+    valid_green  = [c for c in green_contours  if cv2.contourArea(c) > MIN_AREA]
+    valid_danger = [c for c in danger_contours if cv2.contourArea(c) > MIN_AREA]
+
+    green_target  = max(valid_green,  key=cv2.contourArea) if valid_green  else None
+    danger_target = max(valid_danger, key=cv2.contourArea) if valid_danger else None
+
+    # Steer towards the green token
+    if green_target is not None:
+        M = cv2.moments(green_target)
+        if M['m00'] > 0:
+            cx = int(M['m10'] / M['m00'])
+            steering = np.clip((cx - center_x) / center_x, -1.0, 1.0)
+
+    # Override: steer away from the nearest danger token (red/yellow)
+    if danger_target is not None:
+        M = cv2.moments(danger_target)
+        if M['m00'] > 0:
+            dx = int(M['m10'] / M['m00'])
+            danger_area = cv2.contourArea(danger_target)
+            if danger_area > 500:
+                avoid = np.clip(-((dx - center_x) / center_x), -1.0, 1.0)
+                weight = min(danger_area / 5000.0, 1.0)  # stronger avoidance as token gets larger/closer
+                steering = (1.0 - weight) * steering + weight * avoid
+
+    # --- Debug overlay ---
+    debug = front_frame.copy()
+    for c in valid_green:
+        cv2.drawContours(debug, [c], -1, (0, 255, 0), 2)
+    for c in valid_danger:
+        # distinguish red vs yellow in the overlay
+        mask_pt = tuple(c[0][0])
+        _, g, r = front_frame[mask_pt[1], mask_pt[0]]
+        colour = (0, 0, 255) if r > g else (0, 165, 255)
+        cv2.drawContours(debug, [c], -1, colour, 2)
+    cv2.putText(debug, f"Steer: {steering:+.2f}  Accel: {acceleration:.2f}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.imshow("Token Detection", cv2.resize(debug, (640, 480)))
+    cv2.waitKey(1)
+
+    with data_lock:
+        shared_data['steering_input']     = float(steering)
+        shared_data['acceleration_input'] = float(acceleration)
+
 
 def send_controls_task():
-    #This is where you send the control commands to the car using the control_conn
     global control_conn
     if control_conn is None:
         return
-    
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+
+    # steering_input: -1.0 (full left) to 1.0 (full right)
+    # acceleration_input: -1.0 (full reverse) to 1.0 (full forward)
+    with data_lock:
+        steering_input     = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
 
     try:
-        # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
