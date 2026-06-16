@@ -145,6 +145,7 @@ challenge_state = {
     # Fail → all tokens become Yellow (simulator effect, code avoids yellow anyway)
     'low_light_active': False,
     'low_light_triggered': False,
+    'low_light_start_time': 0.0,
 
     # Challenge 2: Chasing Car — switch lanes before collision or -50% speed (up to twice)
     'chase_count': 0,
@@ -165,6 +166,7 @@ challenge_state = {
 
     # Adaptive brightness baseline — updated via EMA during normal (bright) frames
     'brightness_baseline': 100.0,
+    'last_brightness': -1.0,       # previous frame brightness for delta detection
 
     # Permanent speed multiplier — stacks with each -50% penalty
     'speed_multiplier': 1.0,
@@ -240,7 +242,7 @@ def _contour_cx(contour):
     return int(M['m10'] / M['m00']) if M['m00'] > 0 else None
 
 
-def _detect_tokens(frame, h, start_frac=0.30, end_frac=0.90):
+def _detect_tokens(frame, h, start_frac=0.45, end_frac=0.90):
     """
     Scan a window from start_frac to end_frac of frame height.
     In the perspective view, bottom = close, top = far.
@@ -316,7 +318,7 @@ def _detect_police_car(frame, h, w):
     return visible, collision
 
 
-def _detect_red_tokens_only(frame, h, start_frac=0.30, end_frac=0.90):
+def _detect_red_tokens_only(frame, h, start_frac=0.45, end_frac=0.90):
     """Return red-only contours in the standard scanning window."""
     roi = cv2.cvtColor(frame[int(h * start_frac):int(h * end_frac), :], cv2.COLOR_BGR2HSV)
     kernel = np.ones((5, 5), np.uint8)
@@ -443,13 +445,14 @@ def processing_task():
     center_x = w // 2
     GREEN_TAP    = 0.05
     DANGER_TAP   = 0.05
-    TRAILING_TAP = 0.15
+    TRAILING_TAP = 0.25   # larger tap for the 3-second Chase 2 window
 
     # -----------------------------------------------------------------------
     # Challenge 1: Low Light — detect brightness drop via adaptive EMA baseline.
-    # When brightness falls below 50% of the established baseline the light is
-    # considered OFF; send acceleration_input = -1.0 to turn it back ON.
-    # Fail to respond → simulator turns all tokens Yellow (bad random effects).
+    # When brightness falls below 75% of EMA baseline, dark event is active.
+    # Evidence: continuous -1.0 did NOT turn the lights on (brightness never
+    # recovered in camera).  Car now drives normally during darkness.
+    # Fail → simulator turns all tokens Yellow (bad random effects).
     # -----------------------------------------------------------------------
     with data_lock:
         c1_triggered = challenge_state['low_light_triggered']
@@ -459,32 +462,45 @@ def processing_task():
         avg_brightness = float(np.mean(gray))
 
         with data_lock:
-            baseline = challenge_state['brightness_baseline']
+            baseline    = challenge_state['brightness_baseline']
+            prev_bright = challenge_state['last_brightness']
 
             if not challenge_state['low_light_active']:
-                # Keep baseline updated only during normal bright conditions
+                # Update EMA baseline and rolling last-brightness only during normal light
                 challenge_state['brightness_baseline'] = baseline * 0.95 + avg_brightness * 0.05
+                challenge_state['last_brightness']     = avg_brightness
 
-                # Trigger when brightness drops to less than half the established baseline
-                if avg_brightness < baseline * 0.50 and baseline > 30:
-                    challenge_state['low_light_active'] = True
-                    print(f"[C1] Low light! {avg_brightness:.1f} < 50% of baseline {baseline:.1f} — turning light ON.")
+                # Trigger: brightness must fall below 75% of the EMA baseline.
+                # sudden_drop (large single-frame fall) is used only as a label —
+                # it does NOT trigger without the brightness also being genuinely
+                # dark.  A normal curve/shadow fluctuation can drop 15–25 units
+                # in one frame while still being at 80–90% of baseline, so using
+                # OR caused continuous false alarms.
+                genuinely_dark = avg_brightness < baseline * 0.75 and baseline > 20
+                sudden_drop    = prev_bright > 0 and (prev_bright - avg_brightness) > 25
+
+                if genuinely_dark:
+                    challenge_state['low_light_active']    = True
+                    challenge_state['low_light_start_time'] = now
+                    trigger = "sudden-drop" if sudden_drop else "gradual"
+                    print(f"[C1] Low light ({trigger})! "
+                          f"brightness={avg_brightness:.1f}, prev={prev_bright:.1f}, "
+                          f"baseline={baseline:.1f} — driving normally.")
             else:
-                # Recovery: brightness returned to at least 70% of baseline
-                if avg_brightness >= baseline * 0.70:
-                    challenge_state['low_light_active'] = False
+                elapsed_dark = now - challenge_state['low_light_start_time']
+                # Recovery: must reach 85% of baseline (10% above the 75% detection
+                # floor — hysteresis prevents flicker).  2.0s hard timeout as fallback.
+                recovered = avg_brightness >= baseline * 0.85
+                if recovered or elapsed_dark >= 5.0:
+                    challenge_state['low_light_active']    = False
                     challenge_state['low_light_triggered'] = True
-                    print(f"[C1] Light ON. brightness={avg_brightness:.1f} — resuming green token collection.")
+                    how = "brightness" if recovered else "timeout"
+                    print(f"[C1] Dark ended ({how}). "
+                          f"brightness={avg_brightness:.1f}, need>={baseline*0.85:.1f}, "
+                          f"elapsed={elapsed_dark:.2f}s")
 
     with data_lock:
         low_light = challenge_state['low_light_active']
-
-    if low_light:
-        # Send recovery signal; send_controls_task applies the -10% multiplier
-        with data_lock:
-            shared_data['acceleration_input'] = -1.0
-            shared_data['steering_input'] = 0.0
-        return
 
     # -----------------------------------------------------------------------
     # Challenge 3: Police Car — detect blue lights, track 10s timer, seek red
@@ -496,7 +512,7 @@ def processing_task():
         p_done       = challenge_state['police_done']
         p_red_picked = challenge_state['police_red_picked']
 
-    if police_visible and not p_active and not p_done:
+    if police_visible and not p_active and not p_done and control_conn is not None:
         with data_lock:
             challenge_state['police_active']     = True
             challenge_state['police_start_time'] = now
@@ -529,10 +545,17 @@ def processing_task():
                 challenge_state['police_done']   = True
                 print("[C3] Red token collected — police challenge cleared!")
             p_active = False
-        elif _red_token_in_close_range(front_frame, h):
-            with data_lock:
-                challenge_state['police_red_picked'] = True
-                p_red_picked = True
+        else:
+            # Use contour-based detection so road barriers (which share the red hue
+            # but appear as long thin shapes at the frame edges) don't fire falsely.
+            # A collectible token produces a compact contour of at least 800 px².
+            close_red = _detect_red_tokens_only(front_frame, h,
+                                                start_frac=0.70, end_frac=0.95)
+            token_red = [c for c in close_red if cv2.contourArea(c) > 800]
+            if token_red:
+                with data_lock:
+                    challenge_state['police_red_picked'] = True
+                    p_red_picked = True
 
     # -----------------------------------------------------------------------
     # Yellow Token Effect — 5s conservative mode after hitting a yellow token.
@@ -719,7 +742,9 @@ def back_camera_processing_task():
     car_mask  = cv2.bitwise_and(car_mask, cv2.bitwise_and(not_blue, not_green))
 
     car_pixels = int(np.sum(car_mask > 0))
-    trailing   = car_pixels > 3000
+    # Detect at 1500 px (was 3000) so we react earlier — the 3-second Chase 2
+    # window is too tight if we wait until the car is filling the frame.
+    trailing   = car_pixels > 1500
 
     with data_lock:
         auto_state['trailing_car_detected'] = trailing
@@ -774,16 +799,20 @@ def send_controls_task():
             shared_data['steering_input'] = 0.0
         steering     = shared_data['steering_input']
         acceleration = shared_data['acceleration_input']
-        game_over    = challenge_state['game_over']
-        speed_mult   = challenge_state['speed_multiplier']
-        low_light    = challenge_state['low_light_active']
+        game_over         = challenge_state['game_over']
+        speed_mult        = challenge_state['speed_multiplier']
+        low_light         = challenge_state['low_light_active']
 
     if game_over:
         steering     = 0.0
         acceleration = -1.0
+    elif low_light:
+        # C1: keep driving normally during darkness.
+        # Continuous -1.0 (reverse) did not turn lights on and blocked Chase 1.
+        if acceleration > 0:
+            acceleration *= speed_mult
     elif acceleration > 0:
-        # C1: temporary -10% while low light is active; stacks with permanent multiplier
-        acceleration *= speed_mult * (0.9 if low_light else 1.0)
+        acceleration *= speed_mult
 
     try:
         data = struct.pack('ff', steering, acceleration)
