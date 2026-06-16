@@ -4,7 +4,6 @@ import struct
 import cv2
 import numpy as np
 import time
-import keyboard
 import select
 import ctypes
 
@@ -28,7 +27,7 @@ data_lock = threading.Lock()
 is_running = True
 
 # ---------------------------------------------------------
-# Real-Time Scheduling Framework (Do not change this in your code)
+# Real-Time Scheduling Framework
 # ---------------------------------------------------------
 class TaskPriority:
     HIGH = 1
@@ -36,12 +35,6 @@ class TaskPriority:
     LOW = 3
 
 class RTTask(threading.Thread):
-    """
-    Real-Time Task implementing:
-    - Concurrency (inherits threading.Thread)
-    - Task Period (enforced in run loop)
-    - Task Priority (logical priority assigned)
-    """
     def __init__(self, name, period, priority, execute_func):
         super().__init__()
         self.name = name
@@ -73,7 +66,7 @@ class RTTask(threading.Thread):
                 time.sleep(sleep_time)
 
 # ---------------------------------------------------------
-# Network Connection Setup (Do not change this in your code)
+# Network Connection Setup 
 # ---------------------------------------------------------
 front_camera_sock = None
 back_camera_sock = None
@@ -131,17 +124,16 @@ def setup_control_server():
             continue
 
 # ---------------------------------------------------------
-# Task Implementations (This is where you write your tasks)
+# Task Implementations 
 # ---------------------------------------------------------
 
-# Autonomous driving state (protected by data_lock)
 auto_state = {
     'tap_end_time': 0.0,
     'trailing_car_detected': False,
+    'police_detected': False 
 }
 
 def read_single_camera(sock, window_name, data_key):
-    #This function reads the latest frame from the camera socket and stores it in the shared data
     if sock is None:
         return
         
@@ -190,11 +182,6 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
-                
     except Exception as e:
         pass
 
@@ -208,55 +195,41 @@ def _contour_cx(contour):
     M = cv2.moments(contour)
     return int(M['m10'] / M['m00']) if M['m00'] > 0 else None
 
-
 def _detect_tokens(frame, h, start_frac=0.45, end_frac=0.90):
-    """
-    Scan a window from start_frac to end_frac of frame height.
-    In the perspective view, bottom = close, top = far.
-    0.45–0.90 covers roughly one car length ahead, skipping distant horizon tokens.
-    Returns (valid_green, valid_danger) where danger = red + yellow.
-    """
-    roi = cv2.cvtColor(frame[int(h * start_frac):int(h * end_frac), :], cv2.COLOR_BGR2HSV)
+    roi_bgr = frame[int(h * start_frac):int(h * end_frac), :]
+    roi = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     kernel = np.ones((5, 5), np.uint8)
 
-    # Green: tighter hue range, high saturation to avoid grass/road noise
-    green_mask = cv2.morphologyEx(
-        cv2.inRange(roi, np.array([42, 80, 80]), np.array([78, 255, 255])),
-        cv2.MORPH_OPEN, kernel
-    )
-    # Red: two hue segments (wraps around 0/180), high saturation for accuracy
-    red_mask = cv2.morphologyEx(
-        cv2.bitwise_or(
-            cv2.inRange(roi, np.array([0,   100, 100]), np.array([8,   255, 255])),
-            cv2.inRange(roi, np.array([172, 100, 100]), np.array([180, 255, 255]))
-        ),
-        cv2.MORPH_OPEN, kernel
-    )
-    # Yellow: narrow hue band, high saturation to avoid headlights/road markings
-    yellow_mask = cv2.morphologyEx(
-        cv2.inRange(roi, np.array([22, 100, 100]), np.array([33, 255, 255])),
-        cv2.MORPH_OPEN, kernel
-    )
-    danger_mask = cv2.bitwise_or(red_mask, yellow_mask)
+    # Sky brightness scanner
+    sky_bgr = frame[0:int(h * 0.25), :]
+    sky_hsv = cv2.cvtColor(sky_bgr, cv2.COLOR_BGR2HSV)
+    is_dark = np.mean(sky_hsv[:, :, 2]) < 55  # Fine-tuned threshold
+
+    # Ultra Night Vision masks
+    green_mask = cv2.morphologyEx(cv2.inRange(roi, np.array([42, 50, 20]), np.array([78, 255, 255])), cv2.MORPH_OPEN, kernel)
+    red_mask = cv2.morphologyEx(cv2.bitwise_or(
+        cv2.inRange(roi, np.array([0, 50, 20]), np.array([8, 255, 255])),
+        cv2.inRange(roi, np.array([172, 50, 20]), np.array([180, 255, 255]))
+    ), cv2.MORPH_OPEN, kernel)
+    yellow_mask = cv2.morphologyEx(cv2.inRange(roi, np.array([22, 50, 20]), np.array([33, 255, 255])), cv2.MORPH_OPEN, kernel)
 
     MIN_AREA = 200
-    gc, _ = cv2.findContours(green_mask,  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    dc, _ = cv2.findContours(danger_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gc, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rc, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    yc, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
     return (
         [c for c in gc if cv2.contourArea(c) > MIN_AREA],
-        [c for c in dc if cv2.contourArea(c) > MIN_AREA],
+        [c for c in rc if cv2.contourArea(c) > MIN_AREA],
+        [c for c in yc if cv2.contourArea(c) > MIN_AREA],
+        is_dark
     )
 
-
 def _detect_road_offset(frame, h, w):
-    """
-    Estimate lateral drift using red road barriers visible in the lower third.
-    Returns pixel offset: positive means car has drifted left (steer right to correct).
-    """
     lower = cv2.cvtColor(frame[2 * h // 3:, :], cv2.COLOR_BGR2HSV)
     red_mask = cv2.bitwise_or(
-        cv2.inRange(lower, np.array([0,   100, 100]), np.array([10,  255, 255])),
-        cv2.inRange(lower, np.array([170, 100, 100]), np.array([180, 255, 255]))
+        cv2.inRange(lower, np.array([0,   40, 20]), np.array([10,  255, 255])),
+        cv2.inRange(lower, np.array([170, 40, 20]), np.array([180, 255, 255]))
     )
     contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     valid = [c for c in contours if cv2.contourArea(c) > 100]
@@ -267,98 +240,119 @@ def _detect_road_offset(frame, h, w):
         return 0
     return ((xs[0] + xs[-1]) // 2) - (w // 2)
 
-
 def processing_task():
     with data_lock:
         front_frame = shared_data['latest_front_frame']
         tap_end     = auto_state['tap_end_time']
         trailing    = auto_state['trailing_car_detected']
+        police      = auto_state['police_detected']
 
     if front_frame is None:
         return
 
     now = time.time()
-    # Only hard-block during a trailing-car dodge — green can override everything else
-    if now < tap_end and trailing:
-        return
+    is_tapping = now < tap_end
 
     h, w = front_frame.shape[:2]
     center_x = w // 2
-    GREEN_TAP    = 0.05   # short tap: re-evaluate quickly while chasing
-    DANGER_TAP   = 0.05   # fast avoidance tap
-    TRAILING_TAP = 0.15   # full tap: decisive dodge away from trailing car
+    GREEN_TAP    = 0.05
 
-    valid_green, valid_danger = _detect_tokens(front_frame, h)
+    valid_green, valid_red, valid_yellow, is_dark = _detect_tokens(front_frame, h)
     road_offset  = _detect_road_offset(front_frame, h, w)
+    
+    if police:
+        valid_danger = valid_yellow
+    else:
+        valid_danger = valid_red + valid_yellow 
+
+    threats = []
+    for c in valid_danger:
+        cx_val = _contour_cx(c)
+        if cx_val is not None:
+            offset = cx_val - center_x
+            # TIGHTENED THREAT BOX: Only dodge if it's dead ahead (18% width). 
+            # Stops the car from phantom-dodging tokens in other lanes!
+            if abs(offset) < w * 0.18: 
+                threats.append(c)
+
     green_target = max(valid_green, key=cv2.contourArea) if valid_green else None
 
-    # -------------------------------------------------------------------
-    # Autonomous steering — tap-based (slide 9)
-    # Priority: trailing car > green token > danger (red+yellow) > lane centering
-    # Green always overrides danger — never sacrifice a green for avoidance
-    # -------------------------------------------------------------------
     tap_value    = 0.0
     tap_duration = 0.0
+    current_speed = 1.0  
 
-    if trailing:
-        tap_value    = 1.0
-        tap_duration = TRAILING_TAP
+    # NIGHT MODE: Drop speed slightly to give the sensors time to react in the dark
+    if is_dark:
+        current_speed = 0.70
 
-    elif green_target is not None:
-        # Chase green across all lanes — full frame width detected
-        gx = _contour_cx(green_target)
-        if gx is not None:
-            offset = gx - center_x
-            if abs(offset) > w * 0.03:
-                tap_value    = float(np.clip(offset / center_x, -1.0, 1.0))
+    if not is_tapping:
+        # Priority 1: Survive trailing car
+        if trailing:
+            # AGGRESSIVE DODGE: 0.85 to snap out of the way of fast Chasing Cars
+            tap_value = -0.85 if road_offset > 0 else 0.85
+            if road_offset == 0: tap_value = 0.85
+            tap_duration = 0.25 
+
+        # Priority 2: Police Chase 
+        elif police and len(valid_red) > 0:
+            red_target = max(valid_red, key=cv2.contourArea)
+            rx = _contour_cx(red_target)
+            if rx is not None:
+                offset = rx - center_x
+                tap_value    = float(np.clip(offset / center_x, -0.7, 0.7))
                 tap_duration = GREEN_TAP
 
-    elif valid_danger:
-        # Avoid red + yellow as fast as possible when no green is visible
-        avoidance = 0.0
-        total_w   = 0.0
-        for c in valid_danger:
-            cx_val = _contour_cx(c)
-            if cx_val is None:
-                continue
-            area   = cv2.contourArea(c)
-            offset = cx_val - center_x
-            avoidance += (-offset / center_x) * area
-            total_w   += area
-        if total_w > 0:
-            raw = avoidance / total_w
-            tap_value = float(np.clip(raw * 2.5, -1.0, 1.0))
-            if 0 < abs(tap_value) < 0.5:
-                tap_value = 0.5 * np.sign(tap_value)
-            tap_duration = DANGER_TAP
+        # Priority 3: Dodge Threats 
+        elif len(threats) > 0:
+            largest_threat = max(threats, key=cv2.contourArea)
+            tx = _contour_cx(largest_threat)
+            offset = tx - center_x
+            
+            # Smooth, rapid token dodge
+            tap_value = -0.75 if offset > 0 else 0.75
+            tap_duration = 0.15 
 
-    elif abs(road_offset) > w * 0.08:
-        tap_value    = float(np.clip(road_offset / (w * 0.3), -0.5, 0.5))
-        tap_duration = GREEN_TAP
+        # Priority 4: Chase Green
+        elif green_target is not None:
+            gx = _contour_cx(green_target)
+            if gx is not None:
+                offset = gx - center_x
+                tap_value    = float(np.clip(offset / center_x, -0.6, 0.6))
+                tap_duration = GREEN_TAP
+
+        # Priority 5: Lane Centering 
+        elif abs(road_offset) > w * 0.35:
+            tap_value    = float(np.clip(road_offset / (w * 0.3), -0.5, 0.5))
+            tap_duration = GREEN_TAP
+
+        with data_lock:
+            shared_data['acceleration_input'] = current_speed
+            if abs(tap_value) > 0.05:
+                shared_data['steering_input'] = float(tap_value)
+                auto_state['tap_end_time']    = now + tap_duration
+            else:
+                shared_data['steering_input'] = 0.0
+                
+    else:
+        with data_lock:
+            shared_data['acceleration_input'] = current_speed
 
     # --- Debug overlay ---
     debug = front_frame.copy()
     for c in valid_green:
         cv2.drawContours(debug, [c], -1, (0, 255, 0), 2)
     for c in valid_danger:
-        cv2.drawContours(debug, [c], -1, (0, 0, 255), 2)
+        is_threat = any(np.array_equal(c, t) for t in threats)
+        thickness = 4 if is_threat else 1
+        cv2.drawContours(debug, [c], -1, (0, 0, 255), thickness)
+    
     cv2.putText(debug,
-                f"Tap:{tap_value:+.2f}  G:{len(valid_green)} D:{len(valid_danger)}  Trail:{trailing}",
+                f"Tap:{tap_value:+.2f} Locked:{is_tapping} Dark:{is_dark}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.imshow("Token Detection", cv2.resize(debug, (640, 480)))
     cv2.waitKey(1)
 
-    with data_lock:
-        shared_data['acceleration_input'] = 1.0
-        if abs(tap_value) > 0.05:
-            shared_data['steering_input'] = float(tap_value)
-            auto_state['tap_end_time']    = now + tap_duration
-        else:
-            shared_data['steering_input'] = 0.0
-
-
 def back_camera_processing_task():
-    # Detect trailing cars approaching from behind (Trailing Car event)
     with data_lock:
         back_frame = shared_data['latest_back_frame']
 
@@ -366,33 +360,44 @@ def back_camera_processing_task():
         return
 
     h, w = back_frame.shape[:2]
-    # Focus on center-lower region where a close trailing car appears large
     roi = back_frame[h // 2:, w // 4: 3 * w // 4]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    # Cars have saturated colors; exclude road gray, sky blue, and grass green
-    car_mask = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([180, 255, 255]))
+    car_mask = cv2.inRange(hsv, np.array([0, 50, 50]), np.array([180, 255, 255]))
     not_blue  = cv2.bitwise_not(cv2.inRange(hsv, np.array([100, 40, 40]), np.array([130, 255, 255])))
     not_green = cv2.bitwise_not(cv2.inRange(hsv, np.array([35,  40, 40]), np.array([85,  255, 255])))
     car_mask  = cv2.bitwise_and(car_mask, cv2.bitwise_and(not_blue, not_green))
-
+    
+    # HYPER-SENSITIVE RADAR: Trigger instantly (100 pixels) for fast Chasing Cars
     car_pixels = int(np.sum(car_mask > 0))
-    trailing = car_pixels > 3000
+    trailing = car_pixels > 100
+
+    blue_light_mask = cv2.inRange(hsv, np.array([100, 150, 150]), np.array([130, 255, 255]))
+    red_light_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([0, 150, 150]), np.array([10, 255, 255])),
+        cv2.inRange(hsv, np.array([170, 150, 150]), np.array([180, 255, 255]))
+    )
+    police_pixels = cv2.countNonZero(blue_light_mask) + cv2.countNonZero(red_light_mask)
+    police = police_pixels > 300 
 
     with data_lock:
         auto_state['trailing_car_detected'] = trailing
+        auto_state['police_detected'] = police
 
+    debug_back = back_frame.copy()
+    cv2.rectangle(debug_back, (w // 4, h // 2), (3 * w // 4, h), (255, 0, 0), 2)
+    cv2.putText(debug_back, f"Trail: {trailing} | Police: {police}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if not police else (0, 0, 255), 2)
+    cv2.imshow("Back Camera Radar", cv2.resize(debug_back, (640, 480)))
+    cv2.waitKey(1)
 
 def send_controls_task():
     global control_conn
     if control_conn is None:
         return
 
-    # steering_input: -1.0 (full left) to 1.0 (full right)
-    # acceleration_input: -1.0 (full reverse) to 1.0 (full forward)
     now = time.time()
     with data_lock:
-        # Release steering tap when it expires (return to centre)
         if now >= auto_state['tap_end_time']:
             shared_data['steering_input'] = 0.0
         steering_input     = shared_data['steering_input']
@@ -405,30 +410,20 @@ def send_controls_task():
         print(f"Control send error: {e}")
         control_conn = None
 
-
-# ---------------------------------------------------------
-# Main (Scheduler Initialization)
-# ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
     
-    # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
     
     print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
     
-    # This is where you define tasks with explicit Scheduling parameters (Concurrency, Priority, Period)
-    # Period refers to the period of execution of the task in seconds
-    # Priority refers to the priority of the task, higher priority means higher priority
-    # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera    = RTTask("ReadFrontCamera",    period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
     t_back_camera     = RTTask("ReadBackCamera",     period=0.005, priority=TaskPriority.HIGH,   execute_func=read_back_camera_task)
     t_back_processing = RTTask("BackCameraProcess",  period=0.033, priority=TaskPriority.MEDIUM, execute_func=back_camera_processing_task)
     t_processing      = RTTask("Processing",         period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls        = RTTask("SendControls",       period=0.005, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
 
-    # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
     t_back_processing.start()
@@ -436,21 +431,18 @@ if __name__ == '__main__':
     t_controls.start()
     
     try:
-        # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
 
-    # This is to make sure that the tasks are terminated cleanly
     t_front_camera.join()
     t_back_camera.join()
     t_back_processing.join()
     t_processing.join()
     t_controls.join()
     
-    # This is to close all the connections
     if front_camera_sock:
         front_camera_sock.close()
     if back_camera_sock:
