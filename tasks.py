@@ -1,11 +1,14 @@
+import socket
 import time
 import struct
 import threading
 import cv2
 import numpy as np
 
-import sample_drive as _sd
+import shared as _sh
 from state import auto_state, challenge_state, reconnect_state, _reset_session
+
+_c1_log_time = 0.0  # throttle periodic brightness prints
 from vision import (
     _contour_cx,
     _detect_tokens,
@@ -21,15 +24,27 @@ from vision import (
 def _reconnect_control():
     """Background thread: wait for the simulator to reconnect, then reset state."""
     print("[Control] Waiting for new game connection...")
-    _sd.setup_control_server()
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind((_sh.CONTROL_HOST, _sh.CONTROL_PORT))
+    server_sock.listen()
+    server_sock.settimeout(1.0)
+    while _sh.is_running:
+        try:
+            conn, addr = server_sock.accept()
+            print(f"[Control] New game connected from {addr}")
+            _sh.control_conn = conn
+            break
+        except socket.timeout:
+            continue
     _reset_session()
     reconnect_state['ctrl_reconnecting'] = False
     print("[Control] New game session started.")
 
 
 def processing_task():
-    with _sd.data_lock:
-        front_frame = _sd.shared_data['latest_front_frame']
+    with _sh.data_lock:
+        front_frame = _sh.shared_data['latest_front_frame']
         tap_end     = auto_state['tap_end_time']
         trailing    = auto_state['trailing_car_detected']
         game_over   = challenge_state['game_over']
@@ -40,9 +55,9 @@ def processing_task():
     now = time.time()
 
     if game_over:
-        with _sd.data_lock:
-            _sd.shared_data['acceleration_input'] = -1.0
-            _sd.shared_data['steering_input']     = 0.0
+        with _sh.data_lock:
+            _sh.shared_data['acceleration_input'] = -1.0
+            _sh.shared_data['steering_input']     = 0.0
         return
 
     h, w      = front_frame.shape[:2]
@@ -52,45 +67,77 @@ def processing_task():
     TRAILING_TAP = 0.25
 
     # ------------------------------------------------------------------
-    # Challenge 1: Low Light — adaptive EMA baseline detection.
-    # Brightness below 75% of baseline → send acceleration=-1.0 until
-    # brightness recovers to 85%.  No time limit — purely brightness-driven.
+    # Challenge 1: Low Light — slow-decay peak + consecutive dark-frame counter.
+    #
+    # brightness_max tracks the recent peak brightness:
+    #   - jumps UP instantly when a brighter frame arrives
+    #   - decays DOWN at only 0.1 % per frame when it doesn't
+    # This means brightness_max stays at 0.0 until the game scene actually
+    # shows something bright.  Startup dark frames never raise it, so the
+    # threshold (75 % of max) starts at 0 and cannot be crossed until
+    # max > 60 — which eliminates startup false-positives entirely.
+    #
+    # During the actual C1 event brightness_max is frozen (not updated) so
+    # the recovery threshold is anchored to the last pre-dark value.
+    #
+    # Five consecutive dark frames are required to fire (filters 1-4 frame
+    # transients) and the counter re-builds in ~25 ms after any state reset.
     # ------------------------------------------------------------------
-    with _sd.data_lock:
+    global _c1_log_time
+    with _sh.data_lock:
         c1_triggered = challenge_state['low_light_triggered']
 
     if not c1_triggered:
         gray           = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
         avg_brightness = float(np.mean(gray))
 
-        with _sd.data_lock:
-            baseline    = challenge_state['brightness_baseline']
-            prev_bright = challenge_state['last_brightness']
+        with _sh.data_lock:
+            bmax       = challenge_state['brightness_max']
+            dark_count = challenge_state['c1_dark_count']
 
             if not challenge_state['low_light_active']:
-                challenge_state['brightness_baseline'] = baseline * 0.998 + avg_brightness * 0.002
-                challenge_state['last_brightness']     = avg_brightness
+                # Update slow-decay peak (frozen during dark event)
+                if avg_brightness >= bmax:
+                    bmax = avg_brightness           # instant jump up
+                else:
+                    bmax = max(avg_brightness, bmax * 0.999)  # slow decay
+                challenge_state['brightness_max'] = bmax
 
-                sudden_drop    = prev_bright > 50 and (prev_bright - avg_brightness) > 25
-                genuinely_dark = avg_brightness < baseline * 0.75 and prev_bright > 50
+                # Periodic log every 2s
+                if now - _c1_log_time >= 2.0:
+                    _c1_log_time = now
+                    print(f"[C1] brightness={avg_brightness:.1f}  peak={bmax:.1f}  dark_count={dark_count}")
 
-                if genuinely_dark:
-                    challenge_state['low_light_active']     = True
-                    challenge_state['low_light_start_time'] = now
-                    challenge_state['c1_last_report']       = now
-                    trigger = "sudden-drop" if sudden_drop else "gradual"
-                    print(f"[C1] Dark detected ({trigger})! "
-                          f"brightness={avg_brightness:.1f}, baseline={baseline:.1f}"
-                          f" → sending acceleration=-1.0")
+                # Armed only once we've seen a genuinely bright scene (peak > 60).
+                # Dark threshold: current < 75 % of peak brightness.
+                is_dark = bmax > 60 and avg_brightness < bmax * 0.75
+                if is_dark:
+                    dark_count += 1
+                    challenge_state['c1_dark_count'] = dark_count
+                    if dark_count >= 5:
+                        challenge_state['low_light_active']     = True
+                        challenge_state['low_light_start_time'] = now
+                        challenge_state['c1_last_report']       = now
+                        print(f"[C1] Dark detected! brightness={avg_brightness:.1f}  "
+                              f"peak={bmax:.1f} → sending acceleration=-1.0")
+                else:
+                    challenge_state['c1_dark_count'] = 0
             else:
-                recovered = avg_brightness >= baseline * 0.85
+                # brightness_max is frozen — anchored to pre-dark peak value
+                # Recovery: current brightness ≥ 85 % of that peak
+                recovered = avg_brightness >= bmax * 0.85
+                if now - challenge_state['c1_last_report'] >= 1.0:
+                    challenge_state['c1_last_report'] = now
+                    print(f"[C1] Holding -1.0 | brightness={avg_brightness:.1f}  "
+                          f"target≥{bmax * 0.85:.1f}")
                 if recovered:
                     challenge_state['low_light_active']    = False
                     challenge_state['low_light_triggered'] = True
-                    print(f"[C1] Light recovered! "
-                          f"brightness={avg_brightness:.1f}, baseline={baseline:.1f}")
+                    challenge_state['c1_dark_count']       = 0
+                    print(f"[C1] Light recovered! brightness={avg_brightness:.1f}  "
+                          f"peak={bmax:.1f}")
 
-    with _sd.data_lock:
+    with _sh.data_lock:
         low_light = challenge_state['low_light_active']
 
     # ------------------------------------------------------------------
@@ -98,13 +145,13 @@ def processing_task():
     # ------------------------------------------------------------------
     police_visible, police_collision = _detect_police_car(front_frame, h, w)
 
-    with _sd.data_lock:
+    with _sh.data_lock:
         p_active     = challenge_state['police_active']
         p_done       = challenge_state['police_done']
         p_red_picked = challenge_state['police_red_picked']
 
-    if police_visible and not p_active and not p_done and _sd.control_conn is not None:
-        with _sd.data_lock:
+    if police_visible and not p_active and not p_done and _sh.control_conn is not None:
+        with _sh.data_lock:
             challenge_state['police_active']     = True
             challenge_state['police_start_time'] = now
             print("[C3] Police car spotted! Collect a red token within 10s.")
@@ -112,19 +159,19 @@ def processing_task():
 
     if p_active:
         if police_collision:
-            with _sd.data_lock:
+            with _sh.data_lock:
                 challenge_state['game_over'] = True
                 print("[C3] GAME OVER — collided with police car!")
-            with _sd.data_lock:
-                _sd.shared_data['acceleration_input'] = -1.0
-                _sd.shared_data['steering_input']     = 0.0
+            with _sh.data_lock:
+                _sh.shared_data['acceleration_input'] = -1.0
+                _sh.shared_data['steering_input']     = 0.0
             return
 
-        with _sd.data_lock:
+        with _sh.data_lock:
             p_start = challenge_state['police_start_time']
 
         if (now - p_start) >= 10.0 and not p_red_picked:
-            with _sd.data_lock:
+            with _sh.data_lock:
                 challenge_state['police_active']     = False
                 challenge_state['police_done']       = True
                 challenge_state['speed_multiplier'] *= 0.5
@@ -132,16 +179,16 @@ def processing_task():
                       f"Speed×0.5 → {challenge_state['speed_multiplier']:.2f}")
             p_active = False
         elif p_red_picked:
-            with _sd.data_lock:
+            with _sh.data_lock:
                 challenge_state['police_active'] = False
                 challenge_state['police_done']   = True
                 print("[C3] Red token collected — police challenge cleared!")
             p_active = False
         else:
-            close_red  = _detect_red_tokens_only(front_frame, h, start_frac=0.70, end_frac=0.95)
-            token_red  = [c for c in close_red if cv2.contourArea(c) > 800]
+            close_red = _detect_red_tokens_only(front_frame, h, start_frac=0.70, end_frac=0.95)
+            token_red = [c for c in close_red if cv2.contourArea(c) > 800]
             if token_red:
-                with _sd.data_lock:
+                with _sh.data_lock:
                     challenge_state['police_red_picked'] = True
                     p_red_picked = True
 
@@ -149,13 +196,13 @@ def processing_task():
     # Yellow Token Effect — 5s conservative mode
     # ------------------------------------------------------------------
     if _yellow_token_in_close_range(front_frame, h):
-        with _sd.data_lock:
+        with _sh.data_lock:
             if not challenge_state['yellow_effect_active']:
-                challenge_state['yellow_effect_active']  = True
+                challenge_state['yellow_effect_active']   = True
                 challenge_state['yellow_effect_end_time'] = now + 5.0
                 print("[Yellow] Yellow token hit — 5s disruption mode active.")
 
-    with _sd.data_lock:
+    with _sh.data_lock:
         if challenge_state['yellow_effect_active'] and now > challenge_state['yellow_effect_end_time']:
             challenge_state['yellow_effect_active'] = False
             print("[Yellow] Yellow effect expired.")
@@ -199,11 +246,11 @@ def processing_task():
 
     if trailing:
         if valid_danger:
-            avg_dx   = sum((_contour_cx(c) or center_x) for c in valid_danger) / len(valid_danger)
+            avg_dx    = sum((_contour_cx(c) or center_x) for c in valid_danger) / len(valid_danger)
             tap_value = -1.0 if avg_dx > center_x else 1.0
         elif valid_green:
-            green_xs = [_contour_cx(c) for c in valid_green if _contour_cx(c) is not None]
-            avg_gx   = sum(green_xs) / len(green_xs) if green_xs else center_x
+            green_xs  = [_contour_cx(c) for c in valid_green if _contour_cx(c) is not None]
+            avg_gx    = sum(green_xs) / len(green_xs) if green_xs else center_x
             tap_value = 1.0 if avg_gx > center_x else -1.0
         else:
             tap_value = 1.0
@@ -220,7 +267,7 @@ def processing_task():
     elif not current_safe:
         best_lane = max(range(n_lanes), key=_lane_score)
         if best_lane != car_lane:
-            l_x, r_x = lane_bounds[best_lane]
+            l_x, r_x  = lane_bounds[best_lane]
             offset    = ((l_x + r_x) // 2) - center_x
             tap_value = float(np.clip(offset / (w * 0.35), -1.0, 1.0))
             if abs(tap_value) < 0.5:
@@ -253,7 +300,7 @@ def processing_task():
         tap_value *= 0.55
 
     # --- Debug overlay ---
-    with _sd.data_lock:
+    with _sh.data_lock:
         speed_mult   = challenge_state['speed_multiplier']
         p_active_v   = challenge_state['police_active']
         low_light_v  = challenge_state['low_light_active']
@@ -281,19 +328,19 @@ def processing_task():
     cv2.imshow("Token Detection", cv2.resize(debug, (640, 480)))
     cv2.waitKey(1)
 
-    with _sd.data_lock:
-        _sd.shared_data['acceleration_input'] = 1.0
+    with _sh.data_lock:
+        _sh.shared_data['acceleration_input'] = 1.0
         if abs(tap_value) > 0.05:
-            _sd.shared_data['steering_input'] = float(tap_value)
+            _sh.shared_data['steering_input'] = float(tap_value)
             auto_state['tap_end_time']        = now + tap_duration
         else:
-            _sd.shared_data['steering_input'] = 0.0
+            _sh.shared_data['steering_input'] = 0.0
 
 
 def back_camera_processing_task():
     """Detect trailing cars and manage Challenge 2 (Chasing Car)."""
-    with _sd.data_lock:
-        back_frame    = _sd.shared_data['latest_back_frame']
+    with _sh.data_lock:
+        back_frame    = _sh.shared_data['latest_back_frame']
         prev_trailing = auto_state['trailing_car_detected']
 
     if back_frame is None:
@@ -311,7 +358,7 @@ def back_camera_processing_task():
     car_pixels = int(np.sum(car_mask > 0))
     trailing   = car_pixels > 1500
 
-    with _sd.data_lock:
+    with _sh.data_lock:
         auto_state['trailing_car_detected'] = trailing
 
     # ------------------------------------------------------------------
@@ -320,13 +367,13 @@ def back_camera_processing_task():
     now          = time.time()
     chase_limits = (10.0, 3.0)
 
-    with _sd.data_lock:
+    with _sh.data_lock:
         chase_count  = challenge_state['chase_count']
         chase_active = challenge_state['chase_active']
         chase_start  = challenge_state['chase_start_time']
 
     if trailing and not prev_trailing and not chase_active and chase_count < 2:
-        with _sd.data_lock:
+        with _sh.data_lock:
             challenge_state['chase_active']     = True
             challenge_state['chase_start_time'] = now
             print(f"[C2] Chase {chase_count + 1} started! Limit: {chase_limits[chase_count]:.0f}s")
@@ -336,12 +383,12 @@ def back_camera_processing_task():
         elapsed = now - chase_start
 
         if not trailing:
-            with _sd.data_lock:
+            with _sh.data_lock:
                 challenge_state['chase_active'] = False
                 challenge_state['chase_count']  = min(chase_count + 1, 2)
                 print(f"[C2] Chase {chase_count + 1} avoided!")
         elif elapsed > limit:
-            with _sd.data_lock:
+            with _sh.data_lock:
                 challenge_state['chase_active']     = False
                 challenge_state['chase_count']      = min(chase_count + 1, 2)
                 challenge_state['speed_multiplier'] *= 0.5
@@ -350,23 +397,21 @@ def back_camera_processing_task():
 
 
 def send_controls_task():
-    if _sd.control_conn is None:
+    if _sh.control_conn is None:
         if not reconnect_state['ctrl_reconnecting']:
             reconnect_state['ctrl_reconnecting'] = True
             threading.Thread(target=_reconnect_control, daemon=True).start()
         return
 
     now = time.time()
-    with _sd.data_lock:
+    with _sh.data_lock:
         if now >= auto_state['tap_end_time']:
-            _sd.shared_data['steering_input'] = 0.0
-        steering       = _sd.shared_data['steering_input']
-        acceleration   = _sd.shared_data['acceleration_input']
-        game_over      = challenge_state['game_over']
-        speed_mult     = challenge_state['speed_multiplier']
-        low_light      = challenge_state['low_light_active']
-        ll_start       = challenge_state['low_light_start_time']
-        c1_last_report = challenge_state['c1_last_report']
+            _sh.shared_data['steering_input'] = 0.0
+        steering       = _sh.shared_data['steering_input']
+        acceleration   = _sh.shared_data['acceleration_input']
+        game_over  = challenge_state['game_over']
+        speed_mult = challenge_state['speed_multiplier']
+        low_light  = challenge_state['low_light_active']
 
     if game_over:
         steering     = 0.0
@@ -375,16 +420,12 @@ def send_controls_task():
         # C1 spec: send -1.0 to recover the light.
         # Do NOT override steering — Chase 1 steering must still work in parallel.
         acceleration = -1.0
-        if now - c1_last_report >= 1.0:
-            with _sd.data_lock:
-                challenge_state['c1_last_report'] = now
-            print(f"[C1] Holding -1.0 ({now - ll_start:.1f}s elapsed)")
     elif acceleration > 0:
         acceleration *= speed_mult
 
     try:
         data = struct.pack('ff', steering, acceleration)
-        _sd.control_conn.sendall(data)
+        _sh.control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
-        _sd.control_conn = None
+        _sh.control_conn = None

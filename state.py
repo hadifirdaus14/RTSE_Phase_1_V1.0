@@ -1,4 +1,4 @@
-import sample_drive as _sd
+import shared as _sh
 
 # Autonomous driving state (protected by data_lock)
 auto_state = {
@@ -28,10 +28,12 @@ challenge_state = {
     'yellow_effect_active': False,
     'yellow_effect_end_time': 0.0,
 
-    # Adaptive brightness baseline — updated via EMA during normal (bright) frames
-    'brightness_baseline': 100.0,
-    'last_brightness': -1.0,
-    'c1_last_report': 0.0,
+    # C1 brightness tracking
+    # brightness_max: slow-decay peak brightness (rises instantly, falls at 0.1%/frame)
+    # c1_dark_count : consecutive frames below threshold; 5 required to fire
+    'brightness_max':  0.0,
+    'c1_dark_count':   0,
+    'c1_last_report':  0.0,
 
     # Permanent speed multiplier — stacks with each -50% penalty
     'speed_multiplier': 1.0,
@@ -47,7 +49,7 @@ reconnect_state = {
 
 def _reset_session():
     """Reset all challenge and driving state for a new game session."""
-    with _sd.data_lock:
+    with _sh.data_lock:
         challenge_state.update({
             'low_light_active':       False,
             'low_light_triggered':    False,
@@ -62,17 +64,17 @@ def _reset_session():
             'game_over':              False,
             'yellow_effect_active':   False,
             'yellow_effect_end_time': 0.0,
-            'brightness_baseline':    100.0,
-            'last_brightness':        -1.0,
+            'brightness_max':          0.0,
+            'c1_dark_count':          0,
             'c1_last_report':         0.0,
             'speed_multiplier':       1.0,
         })
         auto_state['tap_end_time']          = 0.0
         auto_state['trailing_car_detected'] = False
-        _sd.shared_data['steering_input']     = 0.0
-        _sd.shared_data['acceleration_input'] = 0.0
-        _sd.shared_data['latest_front_frame'] = None
-        _sd.shared_data['latest_back_frame']  = None
+        _sh.shared_data['steering_input']     = 0.0
+        _sh.shared_data['acceleration_input'] = 0.0
+        _sh.shared_data['latest_front_frame'] = None
+        _sh.shared_data['latest_back_frame']  = None
     reconnect_state['front_stale_since'] = 0.0
     reconnect_state['back_stale_since']  = 0.0
     print("[SESSION] State reset — ready for new game run.")
