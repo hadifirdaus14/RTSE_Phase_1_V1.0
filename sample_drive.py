@@ -166,12 +166,59 @@ challenge_state = {
 
     # Adaptive brightness baseline — updated via EMA during normal (bright) frames
     'brightness_baseline': 100.0,
-    'last_brightness': -1.0,       # previous frame brightness for delta detection
+    'last_brightness': -1.0,
+    'c1_last_report': 0.0,         # throttle C1 status prints to once per second
 
     # Permanent speed multiplier — stacks with each -50% penalty
     'speed_multiplier': 1.0,
-    'game_start_time': time.time(),
 }
+
+# Reconnection tracking (module-level, not protected by data_lock)
+_ctrl_reconnecting = False  # True while a background accept() is in progress
+_front_stale_since = 0.0    # time when front camera frames stopped updating
+_back_stale_since  = 0.0    # time when back camera frames stopped updating
+
+def _reset_session():
+    """Reset all challenge and driving state for a new game session."""
+    global _front_stale_since, _back_stale_since
+    with data_lock:
+        challenge_state.update({
+            'low_light_active':     False,
+            'low_light_triggered':  False,
+            'low_light_start_time': 0.0,
+            'chase_count':          0,
+            'chase_active':         False,
+            'chase_start_time':     0.0,
+            'police_active':        False,
+            'police_start_time':    0.0,
+            'police_red_picked':    False,
+            'police_done':          False,
+            'game_over':            False,
+            'yellow_effect_active': False,
+            'yellow_effect_end_time': 0.0,
+            'brightness_baseline':  100.0,
+            'last_brightness':      -1.0,
+            'c1_last_report':       0.0,
+            'speed_multiplier':     1.0,
+        })
+        auto_state['tap_end_time']          = 0.0
+        auto_state['trailing_car_detected'] = False
+        shared_data['steering_input']       = 0.0
+        shared_data['acceleration_input']   = 0.0
+        shared_data['latest_front_frame']   = None
+        shared_data['latest_back_frame']    = None
+    _front_stale_since = 0.0
+    _back_stale_since  = 0.0
+    print("[SESSION] State reset — ready for new game run.")
+
+def _reconnect_control():
+    """Background thread: wait for the simulator to reconnect, then reset state."""
+    global _ctrl_reconnecting
+    print("[Control] Waiting for new game connection...")
+    setup_control_server()   # blocks until simulator connects; sets control_conn
+    _reset_session()
+    _ctrl_reconnecting = False
+    print("[Control] New game session started.")
 
 def read_single_camera(sock, window_name, data_key):
     #This function reads the latest frame from the camera socket and stores it in the shared data
@@ -232,10 +279,66 @@ def read_single_camera(sock, window_name, data_key):
         pass
 
 def read_front_camera_task():
+    global front_camera_sock, _front_stale_since
+    if front_camera_sock is None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect((CAMERA_HOST, FRONT_CAMERA_PORT))
+            front_camera_sock = s
+            print("[Camera] Front camera reconnected.")
+        except Exception:
+            pass
+        return
+    with data_lock:
+        prev = shared_data['latest_front_frame']
     read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
+    with data_lock:
+        curr = shared_data['latest_front_frame']
+    if curr is prev:
+        if _front_stale_since == 0.0:
+            _front_stale_since = time.time()
+        elif time.time() - _front_stale_since > 2.0:
+            try:
+                front_camera_sock.close()
+            except Exception:
+                pass
+            front_camera_sock = None
+            _front_stale_since = 0.0
+            print("[Camera] Front camera disconnected.")
+    else:
+        _front_stale_since = 0.0
 
 def read_back_camera_task():
+    global back_camera_sock, _back_stale_since
+    if back_camera_sock is None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect((CAMERA_HOST, BACK_CAMERA_PORT))
+            back_camera_sock = s
+            print("[Camera] Back camera reconnected.")
+        except Exception:
+            pass
+        return
+    with data_lock:
+        prev = shared_data['latest_back_frame']
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
+    with data_lock:
+        curr = shared_data['latest_back_frame']
+    if curr is prev:
+        if _back_stale_since == 0.0:
+            _back_stale_since = time.time()
+        elif time.time() - _back_stale_since > 2.0:
+            try:
+                back_camera_sock.close()
+            except Exception:
+                pass
+            back_camera_sock = None
+            _back_stale_since = 0.0
+            print("[Camera] Back camera disconnected.")
+    else:
+        _back_stale_since = 0.0
 
 def _contour_cx(contour):
     M = cv2.moments(contour)
@@ -449,9 +552,8 @@ def processing_task():
 
     # -----------------------------------------------------------------------
     # Challenge 1: Low Light — detect brightness drop via adaptive EMA baseline.
-    # When brightness falls below 75% of EMA baseline, dark event is active.
-    # Evidence: continuous -1.0 did NOT turn the lights on (brightness never
-    # recovered in camera).  Car now drives normally during darkness.
+    # When brightness falls below 75% of EMA baseline, send acceleration=-1.0
+    # until brightness recovers (per spec).  8s hard timeout as fallback.
     # Fail → simulator turns all tokens Yellow (bad random effects).
     # -----------------------------------------------------------------------
     with data_lock:
@@ -467,7 +569,7 @@ def processing_task():
 
             if not challenge_state['low_light_active']:
                 # Update EMA baseline and rolling last-brightness only during normal light
-                challenge_state['brightness_baseline'] = baseline * 0.95 + avg_brightness * 0.05
+                challenge_state['brightness_baseline'] = baseline * 0.998 + avg_brightness * 0.002
                 challenge_state['last_brightness']     = avg_brightness
 
                 # Trigger: brightness must fall below 75% of the EMA baseline.
@@ -476,28 +578,26 @@ def processing_task():
                 # dark.  A normal curve/shadow fluctuation can drop 15–25 units
                 # in one frame while still being at 80–90% of baseline, so using
                 # OR caused continuous false alarms.
-                genuinely_dark = avg_brightness < baseline * 0.75 and baseline > 20
-                sudden_drop    = prev_bright > 0 and (prev_bright - avg_brightness) > 25
+                sudden_drop    = prev_bright > 50 and (prev_bright - avg_brightness) > 25
+                genuinely_dark = avg_brightness < baseline * 0.75 and prev_bright > 50
 
                 if genuinely_dark:
                     challenge_state['low_light_active']    = True
                     challenge_state['low_light_start_time'] = now
+                    challenge_state['c1_last_report']      = now
                     trigger = "sudden-drop" if sudden_drop else "gradual"
-                    print(f"[C1] Low light ({trigger})! "
-                          f"brightness={avg_brightness:.1f}, prev={prev_bright:.1f}, "
-                          f"baseline={baseline:.1f} — driving normally.")
+                    print(f"[C1] Dark detected ({trigger})! "
+                          f"brightness={avg_brightness:.1f}, baseline={baseline:.1f}"
+                          f" → sending acceleration=-1.0")
             else:
-                elapsed_dark = now - challenge_state['low_light_start_time']
-                # Recovery: must reach 85% of baseline (10% above the 75% detection
-                # floor — hysteresis prevents flicker).  2.0s hard timeout as fallback.
+                # Recovery: brightness must return to 85% of baseline.
+                # No time limit — exit only when the game actually restores light.
                 recovered = avg_brightness >= baseline * 0.85
-                if recovered or elapsed_dark >= 5.0:
+                if recovered:
                     challenge_state['low_light_active']    = False
                     challenge_state['low_light_triggered'] = True
-                    how = "brightness" if recovered else "timeout"
-                    print(f"[C1] Dark ended ({how}). "
-                          f"brightness={avg_brightness:.1f}, need>={baseline*0.85:.1f}, "
-                          f"elapsed={elapsed_dark:.2f}s")
+                    print(f"[C1] Light recovered! "
+                          f"brightness={avg_brightness:.1f}, baseline={baseline:.1f}")
 
     with data_lock:
         low_light = challenge_state['low_light_active']
@@ -786,8 +886,11 @@ def back_camera_processing_task():
 
 
 def send_controls_task():
-    global control_conn
+    global control_conn, _ctrl_reconnecting
     if control_conn is None:
+        if not _ctrl_reconnecting:
+            _ctrl_reconnecting = True
+            threading.Thread(target=_reconnect_control, daemon=True).start()
         return
 
     # steering_input: -1.0 (full left) to 1.0 (full right)
@@ -797,20 +900,26 @@ def send_controls_task():
         # Release steering tap when it expires (return to centre)
         if now >= auto_state['tap_end_time']:
             shared_data['steering_input'] = 0.0
-        steering     = shared_data['steering_input']
-        acceleration = shared_data['acceleration_input']
+        steering          = shared_data['steering_input']
+        acceleration      = shared_data['acceleration_input']
         game_over         = challenge_state['game_over']
         speed_mult        = challenge_state['speed_multiplier']
         low_light         = challenge_state['low_light_active']
+        ll_start          = challenge_state['low_light_start_time']
+        c1_last_report    = challenge_state['c1_last_report']
 
     if game_over:
         steering     = 0.0
         acceleration = -1.0
     elif low_light:
-        # C1: keep driving normally during darkness.
-        # Continuous -1.0 (reverse) did not turn lights on and blocked Chase 1.
-        if acceleration > 0:
-            acceleration *= speed_mult
+        # C1 spec: send -1.0 to recover the light.
+        # Do NOT override steering — Chase 1 steering must still work in parallel.
+        acceleration = -1.0
+        if now - c1_last_report >= 1.0:
+            with data_lock:
+                challenge_state['c1_last_report'] = now
+            elapsed_ll = now - ll_start
+            print(f"[C1] Holding -1.0 ({elapsed_ll:.1f}s elapsed)")
     elif acceleration > 0:
         acceleration *= speed_mult
 
