@@ -415,21 +415,23 @@ if __name__ == '__main__':
     
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
-    
+
     print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
-    
-    t_front_camera    = RTTask("ReadFrontCamera",    period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
-    t_back_camera     = RTTask("ReadBackCamera",     period=0.005, priority=TaskPriority.HIGH,   execute_func=read_back_camera_task)
-    t_back_processing = RTTask("BackCameraProcess",  period=0.033, priority=TaskPriority.MEDIUM, execute_func=back_camera_processing_task)
-    t_processing      = RTTask("Processing",         period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
-    t_controls        = RTTask("SendControls",       period=0.005, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
+
+    # Period  = execution interval in seconds
+    # Priority = task scheduling priority (HIGH > MEDIUM > LOW)
+    t_front_camera    = RTTask("ReadFrontCamera",   period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
+    t_back_camera     = RTTask("ReadBackCamera",    period=0.005, priority=TaskPriority.HIGH,   execute_func=read_back_camera_task)
+    t_back_processing = RTTask("BackCameraProcess", period=0.033, priority=TaskPriority.MEDIUM, execute_func=back_camera_processing_task)
+    t_processing      = RTTask("Processing",        period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_controls        = RTTask("SendControls",      period=0.005, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
 
     t_front_camera.start()
     t_back_camera.start()
     t_back_processing.start()
     t_processing.start()
     t_controls.start()
-    
+
     try:
         while is_running:
             time.sleep(1)
@@ -442,7 +444,7 @@ if __name__ == '__main__':
     t_back_processing.join()
     t_processing.join()
     t_controls.join()
-    
+
     if front_camera_sock:
         front_camera_sock.close()
     if back_camera_sock:
